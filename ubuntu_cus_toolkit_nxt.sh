@@ -524,7 +524,7 @@ fi
 
 check_root
 check_environment
-configure_dns_and_syslog
+configure_dns
 configure_ssh
 configure_samba
 configure_ssl_compat
