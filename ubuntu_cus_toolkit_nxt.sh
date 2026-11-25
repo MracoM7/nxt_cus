@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Custom Ubuntu ISO configuration for FortiDeceptor.
-# Run as root after install_ubuntu_modules_nxt_2.sh.
+# Run as root after install_ubuntu_modules_nxt.sh.
 
 export PATH="$PATH:/usr/sbin:/sbin"
 export DEBIAN_FRONTEND=noninteractive
@@ -38,13 +38,13 @@ check_environment() {
     exit 1
   fi
 
-  local bins=(python3 ifconfig setfacl rsyslogd)
+  local bins=(python3 ifconfig setfacl)
   if $ENABLE_SSH; then bins+=(sshd); fi
   if $ENABLE_GIT; then bins+=(git); fi
 
   for bin in "${bins[@]}"; do
     if ! command -v "${bin}" >/dev/null 2>&1; then
-      echo -e "${red}${bin} not found, run install_ubuntu_modules_nxt_2.sh first${clear}"
+      echo -e "${red}${bin} not found, run install_ubuntu_modules_nxt.sh first${clear}"
       exit 1
     fi
   done
@@ -65,7 +65,7 @@ check_environment() {
   echo -e "${green}Environment check passed${clear}"
 }
 
-configure_dns_and_syslog() {
+configure_dns() {
   echo -e "${blue}Configuring DNS fallback and syslog routing...${clear}"
 
   if [ -d "/etc/cloud/cloud.cfg.d" ]; then
@@ -86,20 +86,7 @@ exit 0
 EOL
   chmod 755 /usr/local/sbin/resolvconf
 
-  mkdir -p /var/log/samba
-  touch /var/log/samba/smbd_audit.log
-  chown syslog:adm /var/log/samba/smbd_audit.log 2>/dev/null || true
-  chmod 640 /var/log/samba/smbd_audit.log
-
-  cat > /etc/rsyslog.d/10-fdc-monitors.conf <<'EOL'
-if ($programname == "smbd_audit") then {
-    action(type="omfile" file="/var/log/samba/smbd_audit.log" template="RSYSLOG_TraditionalFileFormat")
-}
-EOL
-
-  systemctl enable rsyslog >/dev/null 2>&1
-  systemctl restart rsyslog
-  echo -e "${green}DNS and syslog routing configured${clear}"
+  echo -e "${green}DNS configured${clear}"
 }
 
 configure_ssh() {
