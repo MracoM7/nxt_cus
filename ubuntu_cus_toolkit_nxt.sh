@@ -1,16 +1,10 @@
 #!/bin/bash
 
-# Universal FortiDeceptor customization for Ubuntu Server (tested 20.04 -> 26.04).
-#
-# The script is re-runnable: every run converges the image to the flags below,
-# enabling what is on and removing what is off. Typical workflow:
-#   1. fresh install -> run with the defaults -> save as BASE image in FDC
-#   2. re-customize BASE -> run with different flags -> save as a new image
-#
-# Flags can be set from the environment, without editing the file:
-#   ENABLE_HTTP_NATIVE=false ENABLE_HTTP_APACHE=true bash ubuntu_cus_toolkit_nxt.sh
-#
-# Run as root after install_ubuntu_modules_nxt.sh (needed only on a fresh install).
+# FortiDeceptor custom image toolkit for Ubuntu Server (tested 20.04-26.04).
+# Re-runnable: each run aligns the image to the flags (on = install, off = remove),
+# so derived images can be built from a customized BASE.
+# Flags via environment, e.g.: ENABLE_HTTP_NATIVE=false ENABLE_HTTP_APACHE=true bash ubuntu_cus_toolkit_nxt.sh
+# Run as root, after install_ubuntu_modules_nxt.sh on a fresh install.
 
 export PATH="$PATH:/usr/sbin:/sbin"
 export DEBIAN_FRONTEND=noninteractive
@@ -19,23 +13,26 @@ export DEBIAN_FRONTEND=noninteractive
 : "${ENABLE_SSH:=true}"
 : "${ENABLE_SAMBA:=true}"
 : "${ENABLE_HTTP_NATIVE:=true}"     # FDC built-in web page (Tornado)
-: "${ENABLE_HTTP_APACHE:=false}"    # real Apache site (e.g. WordPress) feeding the FDC web monitor
+: "${ENABLE_HTTP_APACHE:=false}"    # real Apache site (e.g. WordPress), logged as FDC web events
 : "${ENABLE_GIT:=false}"            # hangs at deploy, keep off
 : "${ENABLE_SMTP:=true}"
 : "${ENABLE_FTP:=true}"
 : "${ENABLE_RADIUS:=true}"
 : "${ENABLE_VNC:=true}"
 
-: "${ENABLE_CMD_LOGGING:=true}"     # alert on every command line typed in an interactive bash
-: "${ENABLE_EXEC_AUDIT:=true}"      # auditd: alert on commands typed in shells the bash hook misses
+: "${ENABLE_CMD_LOGGING:=true}"     # bash hook: alert per typed command line
+: "${ENABLE_EXEC_AUDIT:=true}"      # auditd: commands in shells the hook misses
 
-: "${DISABLE_SYSTEM_SSHD:=true}"    # mask Ubuntu's sshd: FDC runs its own bundled sshd
-: "${APACHE_AUTO_INSTALL:=true}"    # install apache2 if Apache mode is on and it is missing
-: "${WP_LOGIN_HOOK:=auto}"          # auto|true|false: WordPress login events with user/pass
+: "${DEPLOY_DIAG:=false}"           # debug: report a stuck deploy to FDC
+: "${DEPLOY_DIAG_MIN:=20}"          # minutes after boot
+
+: "${DISABLE_SYSTEM_SSHD:=true}"    # FDC runs its own sshd
+: "${APACHE_AUTO_INSTALL:=true}"    # install apache2 if missing
+: "${WP_LOGIN_HOOK:=auto}"          # auto|true|false: WordPress logins with user/pass
 : "${WP_ROOT:=/var/www/html}"
 
 # ---------------------------------------------------------------- paths
-# Neutral names: an attacker with a shell on the decoy should not read "fdc" anywhere.
+# Neutral names: nothing on the decoy should mention FDC.
 WEB_LOG=/var/log/linux_web.log                     # read by FDC TornadoWebMonitor
 LOGGER=/usr/local/sbin/a2logrelay
 LOG_CONF=logging-relay                             # /etc/apache2/conf-available/logging-relay.conf
@@ -44,7 +41,7 @@ CERT_SYNC=/usr/local/sbin/a2certsync
 CERT_UNIT=apache2-certsync
 APACHE_OVERRIDE=/etc/systemd/system/apache2.service.d/override.conf
 WP_HOOK_FILE=audit-log.php
-FORWARDER=/usr/local/sbin/audit-forwarder         # relays shell activity to FDC (127.0.0.1:1399)
+FORWARDER=/usr/local/sbin/audit-forwarder         # -> FDC event receiver 127.0.0.1:1399
 FORWARDER_UNIT=audit-forwarder
 AUDISP_PLUGIN=/usr/local/sbin/audisp-forward
 AUDIT_RULES=/etc/audit/rules.d/50-user-exec.rules
@@ -70,12 +67,15 @@ validate_flags() {
   local f
   for f in ENABLE_SSH ENABLE_SAMBA ENABLE_HTTP_NATIVE ENABLE_HTTP_APACHE ENABLE_GIT \
            ENABLE_SMTP ENABLE_FTP ENABLE_RADIUS ENABLE_VNC ENABLE_CMD_LOGGING ENABLE_EXEC_AUDIT \
-           DISABLE_SYSTEM_SSHD APACHE_AUTO_INSTALL; do
+           DEPLOY_DIAG DISABLE_SYSTEM_SSHD APACHE_AUTO_INSTALL; do
     if [ "${!f}" != "true" ] && [ "${!f}" != "false" ]; then
       echo -e "${red}${f} must be true or false (got '${!f}')${clear}"
       exit 1
     fi
   done
+  case "$DEPLOY_DIAG_MIN" in ''|*[!0-9]*)
+    echo -e "${red}DEPLOY_DIAG_MIN must be a number of minutes${clear}"; exit 1 ;;
+  esac
   case "$WP_LOGIN_HOOK" in auto|true|false) ;; *)
     echo -e "${red}WP_LOGIN_HOOK must be auto, true or false${clear}"; exit 1 ;;
   esac
@@ -123,8 +123,8 @@ check_environment() {
   echo -e "${green}Environment check passed${clear}"
 }
 
-# Engine bug on Ubuntu != 24.x: it calls the removed `systemd-resolve`, then falls back to
-# `resolvconf -u`. We make the first call fail cleanly and provide a minimal resolvconf.
+# Engine bug on Ubuntu != 24.x: calls the removed systemd-resolve, then `resolvconf -u`.
+# Make the first fail cleanly and provide a minimal resolvconf.
 configure_dns() {
   echo -e "${blue}Configuring DNS fallback...${clear}"
 
@@ -148,15 +148,18 @@ EOL
   chmod 755 /usr/local/sbin/resolvconf
   ln -sfn /usr/local/sbin/resolvconf /usr/sbin/resolvconf
 
+  # The engine configures the network itself: skip the ~2 min wait at every boot.
+  systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service >/dev/null 2>&1 || true
+
   echo -e "${green}DNS configured${clear}"
 }
 
-# Python 3.12+ removed ssl.wrap_socket and OpenSSL 3 rejects the engine's legacy TLS.
+# Python 3.12 removed ssl.wrap_socket; OpenSSL 3 rejects the engine's legacy TLS.
 configure_ssl_compat() {
   echo -e "${blue}Configuring OpenSSL SECLEVEL=1 and Python SSL compatibility...${clear}"
 
   if [ -f /etc/ssl/openssl.cnf ]; then
-    # migrate sections written by older versions of this script
+    # rename sections written by older versions
     sed -i 's/fdc_ssl_sect/tls_compat_sect/g; s/fdc_tls_defaults/tls_compat_defaults/g' /etc/ssl/openssl.cnf
     if ! grep -q '^\[tls_compat_defaults\]' /etc/ssl/openssl.cnf; then
       cat >> /etc/ssl/openssl.cnf <<'EOL'
@@ -219,9 +222,7 @@ EOL
   fi
 }
 
-# FDC starts its own bundled sshd (/root/init/trapinit/openssh) when SSH is selected.
-# Ubuntu's sshd is never needed at deploy; left enabled, it stays exposed and unmonitored
-# whenever SSH is not ticked in the deploy wizard.
+# FDC runs its own sshd. Ubuntu's would stay exposed, unmonitored, if SSH is not ticked.
 configure_ssh() {
   if on DISABLE_SYSTEM_SSHD; then
     echo -e "${blue}Masking Ubuntu sshd (FDC uses its own)...${clear}"
@@ -236,13 +237,12 @@ configure_ssh() {
 }
 
 configure_samba() {
-  # FDC extracts its own Samba (/opt/samba4); the system one must not run.
+  # FDC runs its own Samba (/opt/samba4).
   systemctl disable --now smbd nmbd >/dev/null 2>&1 || true
   on ENABLE_SAMBA && SERVICES+=("samba")
 }
 
-# Removes everything the Apache mode installs, including files named by older versions
-# of this script, so every run starts from a clean state.
+# Undo Apache mode, including file names used by older versions.
 remove_apache_integration() {
   rm -f "$APACHE_OVERRIDE"
   rmdir /etc/systemd/system/apache2.service.d 2>/dev/null
@@ -257,7 +257,7 @@ remove_apache_integration() {
   fi
   rm -f "/etc/apache2/conf-available/${LOG_CONF}.conf" /etc/apache2/conf-available/fdc-monitor.conf \
         "/etc/apache2/sites-available/${SSL_SITE}.conf" /etc/apache2/sites-available/fdc-default-ssl.conf
-  # per-vhost CustomLog lines injected by older versions
+  # CustomLog lines injected by older versions
   if [ -d /etc/apache2/sites-available ]; then
     sed -i '/fdc_web_logger\.py\|a2logrelay/d' /etc/apache2/sites-available/*.conf 2>/dev/null
   fi
@@ -309,7 +309,7 @@ function auth_audit_write($user, $pass, $result) {
     if ($json === false) {
         return;
     }
-    // the FDC monitor cuts the JSON at the first '}': escape braces inside values
+    // keep '{' and '}' out of the values
     $json = '{' . str_replace(array('{', '}'), array('\\u007b', '\\u007d'), substr($json, 1, -1)) . '}';
     // WordPress forces PHP to UTC: use the system timezone, like the Apache relay does
     $tz = @timezone_open(trim((string) @file_get_contents('/etc/timezone'))) ?: timezone_open('UTC');
@@ -366,9 +366,8 @@ EOL
   touch "$WEB_LOG"
   chmod 644 "$WEB_LOG"
 
-  # Apache access log -> line format parsed by FDC TornadoWebMonitor:
-  #   [I yymmdd HH:MM:SS web:NNNN] <status> {flat JSON}
-  # The monitor slices from the first '{' to the first '}', so braces in values are escaped.
+  # Access log -> format read by the FDC web monitor: [I yymmdd HH:MM:SS web:N] <status> {json}
+  # The monitor cuts the JSON at the first '}': braces in values are escaped.
   cat > "$LOGGER" <<'EOL'
 #!/usr/bin/env python3
 import json
@@ -415,7 +414,7 @@ GlobalLog "|${LOGGER}" relay_tsv
 EOL
   a2enconf -q "$LOG_CONF" >/dev/null 2>&1
 
-  # FDC injects its certificate for the HTTPS service at deploy: reuse it in Apache.
+  # Reuse the HTTPS certificate FDC installs at deploy.
   cat > "$CERT_SYNC" <<'EOL'
 #!/bin/sh
 for dir in /usr/local/web /root/init/trapinit/event_tracers/decoy_common/extention_service/web; do
@@ -429,9 +428,8 @@ done
 EOL
   chmod 755 "$CERT_SYNC"
 
-  # RefuseManualStop: the engine runs `systemctl stop apache2` during decoy preparation.
-  # Apache must keep ports 80/443 so FDC's own Tornado server fails to bind; the FDC
-  # monitor keeps reading linux_web.log, which is now fed by Apache.
+  # RefuseManualStop: the engine stops apache2 at deploy. Apache must keep 80/443 so the
+  # FDC web server fails to bind, while the FDC monitor keeps reading linux_web.log.
   mkdir -p "$(dirname "$APACHE_OVERRIDE")"
   cat > "$APACHE_OVERRIDE" <<EOL
 [Unit]
@@ -490,7 +488,7 @@ configure_http_https() {
     return 0
   fi
 
-  # Native mode, or no web at all: no real web server may run on the decoy.
+  # Native or no web: no real web server may run.
   systemctl disable --now apache2 nginx >/dev/null 2>&1 || true
   if on ENABLE_HTTP_NATIVE; then
     SERVICES+=("http_v2" "https_v2")
@@ -515,12 +513,10 @@ configure_builtin_services() {
   return 0
 }
 
-# Commands typed outside the FDC fake shell (after `bash`, `sh`, a python pty, ...) are sent
-# to the FDC event receiver in the fake shell's own format: they show up as SSH command
-# alerts of the attacker's session (FDC matches them by username).
-#   - bash hook (PS0): one message per command line typed at an interactive bash prompt
-#   - auditd execve: only for commands typed in interactive shells the hook does not cover
-# Never reported: shell startup files, tab completion, prompt hooks, the inside of scripts.
+# Commands typed outside the FDC fake shell (bash, sh, python pty...) become SSH command
+# alerts, sent in the fake shell's format (FDC matches the session by username).
+# bash: PS0 hook, one alert per typed line. Other shells: auditd execve, typed commands only.
+# Never reported: startup files, tab completion, prompt hooks, commands inside scripts.
 remove_session_logging() {
   sed -i '/^# >>> session-logging >>>$/,/^# <<< session-logging <<<$/d' "$BASHRC"
   systemctl disable --now "${FORWARDER_UNIT}.service" >/dev/null 2>&1 || true
@@ -541,19 +537,10 @@ configure_session_logging() {
 
   cat > "$FORWARDER" <<'EOL'
 #!/usr/bin/env python3
-# Forwards interactive shell activity to the local event collector.
-#
-# Two inputs, one output (the FDC event receiver on 127.0.0.1:1399, same message the
-# engine's fake shell sends, so alerts look exactly like native SSH command alerts):
-#   - UDP 127.0.0.1:5140   one message per command line typed in an interactive bash
-#                          (PS0 hook in /etc/bash.bashrc)
-#   - unix socket          execve audit records (auditd plugin), used only for commands
-#                          typed in interactive shells the bash hook does not cover
-#                          (sh/dash, bash --norc, a bash whose hook was removed, ...)
-#
-# Noise rules: an exec is reported only if its parent is an interactive shell (stdin on a
-# tty, no script, no -c), that shell is not covered by a recent hook message, and the
-# shell is past its startup files. Children of scripts and of `sh -c` are never reported.
+# Forwards interactive shell activity to the local audit collector.
+# Inputs: UDP 127.0.0.1:5140 (bash session logging), unix socket (auditd execve records).
+# An exec is reported only if its parent is an interactive shell (tty, no script, no -c)
+# not covered by a recent session-logging message and past its startup files.
 import base64
 import json
 import os
@@ -938,9 +925,184 @@ EOL
   fi
 }
 
+# Debug: if the engine has not finished DEPLOY_DIAG_MIN minutes after boot, report the
+# failure to FDC (with a summary of where it stopped) through the engine's own function.
+configure_deploy_diag() {
+  systemctl disable --now boot-healthcheck.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/boot-healthcheck.service /etc/systemd/system/boot-healthcheck.timer \
+        /usr/local/sbin/boot-healthcheck
+  if ! on DEPLOY_DIAG; then
+    systemctl daemon-reload
+    return 0
+  fi
+  echo -e "${blue}Installing deploy diagnostics (${DEPLOY_DIAG_MIN} min)...${clear}"
+  cat > /usr/local/sbin/boot-healthcheck <<'EOL'
+#!/usr/bin/env python3
+# Boot health check: report an unfinished initialization, with a short diagnosis.
+import glob
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get("HC_ROOT", "/root")
+DONE_FLAG = os.path.join(ROOT, "flag.init.done")
+CDROM_MNT = "/mnt/hc"
+EXC = re.compile(r"[A-Za-z_][\w.]*(Error|Exception|Exit)\b")
+UNIT = re.compile(r"\S+\.(service|socket|mount|timer|path|target|scope|slice|device|swap)$")
+CONF_NAMES = ("instanceinit.json", "trapinit/instanceinit.json", "trapinit/instance.json")
+
+
+def sh(cmd, limit=4000):
+    try:
+        out = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             timeout=20).stdout.decode("utf-8", "replace")
+    except Exception as e:
+        out = "<{}>".format(e)
+    return out[-limit:]
+
+
+def find_engine():
+    base = os.path.join(ROOT, "init")
+    if not os.path.isdir(os.path.join(base, "trapinit")):
+        os.makedirs(CDROM_MNT, exist_ok=True)
+        sh("mount -o ro /dev/cdrom {}".format(CDROM_MNT))
+        base = CDROM_MNT
+    conf = None
+    for name in (os.path.join(ROOT, "instanceinit.json"),) + tuple(os.path.join(base, n) for n in CONF_NAMES):
+        if os.path.isfile(name):
+            with open(name) as f:
+                conf = json.load(f)
+            break
+    return os.path.join(base, "trapinit"), conf
+
+
+def monitor_ip(conf):
+    for itf in conf.get("network", {}).get("interfaces", []):
+        if (itf.get("brname") or "").lower() == "decoy-br":
+            return itf["monitor"]["ip"].split("/")[0]
+    return "10.254.254.1"
+
+
+def last_error():
+    best = (0, "")
+    for path in glob.glob(os.path.join(ROOT, "*.log")) + glob.glob(os.path.join(ROOT, "*.log.*")):
+        try:
+            mtime = os.path.getmtime(path)
+            with open(path, errors="replace") as f:
+                lines = f.readlines()[-400:]
+        except OSError:
+            continue
+        for line in reversed(lines):
+            low = line.lower()
+            if "traceback (most recent" in low:
+                continue    # the exception line below it is more useful, and is found first
+            if EXC.match(line.strip()) or "error" in low or "failed" in low:
+                if mtime >= best[0]:
+                    best = (mtime, "{}: {}".format(os.path.basename(path), line.strip()))
+                break
+    return best[1][:250] or "no error line found in /root logs"
+
+
+def last_step():
+    """Last 'SUCCESS: ...' line of the engine init log: how far initialization got."""
+    for path in (os.path.join(ROOT, "LinuxInit.log"),):
+        try:
+            with open(path, errors="replace") as f:
+                lines = f.readlines()[-2000:]
+        except OSError:
+            return "no LinuxInit.log (init never started?)"
+        for line in reversed(lines):
+            if "SUCCESS:" in line:
+                return line.split("SUCCESS:", 1)[1].strip()[:80]
+        return "LinuxInit.log has no SUCCESS step"
+    return ""
+
+
+def failed_units():
+    out = sh("systemctl list-units --failed --plain --no-legend --no-pager")
+    names = [l.split()[0] for l in out.splitlines() if l.strip() and UNIT.match(l.split()[0])]
+    return ",".join(names)[:120] or "none"
+
+
+def write_diag(stage):
+    parts = ["stage: " + stage, "uptime: " + sh("uptime")]
+    for title, cmd in (
+        ("/root", "ls -la {}".format(ROOT)),
+        ("failed units", "systemctl --failed --no-pager"),
+        ("launcherD", "systemctl status launcherD --no-pager -n 30"),
+        ("journal errors, previous boot", "journalctl -b -1 -p err --no-pager -n 120"),
+        ("journal errors, this boot", "journalctl -b -p err --no-pager -n 120"),
+        ("network", "ip -br a; ip r; cat /etc/resolv.conf"),
+        ("listening", "ss -lntup"),
+        ("processes", "ps -eo pid,ppid,user,etime,cmd --forest | head -150"),
+        ("audit", "auditctl -s; auditctl -l"),
+    ):
+        parts.append("===== {} =====\n{}".format(title, sh(cmd)))
+    for path in sorted(glob.glob(os.path.join(ROOT, "*.log"))):
+        parts.append("===== tail {} =====\n{}".format(path, sh("tail -n 60 '{}'".format(path))))
+    with open(os.path.join(ROOT, "diag.txt"), "w") as f:
+        f.write("\n\n".join(parts))
+
+
+def main():
+    if os.path.exists(DONE_FLAG):
+        return 0
+    engine, conf = find_engine()
+    if conf is None:
+        return 0                      # not a deployed decoy (e.g. customization VM)
+    stage = "init not completed {:.0f} min after boot".format(
+        float(open("/proc/uptime").read().split()[0]) / 60)
+    write_diag(stage)
+    flags = ",".join(n for n in ("disabled", "ready.flg") if os.path.exists(os.path.join(ROOT, n))) or "none"
+    msg = "diag: {} | last step: {} | flags: {} | failed units: {} | last error: {}".format(
+        stage, last_step(), flags, failed_units(), last_error())
+
+    logging.basicConfig(filename=os.path.join(ROOT, "healthcheck.log"), level=logging.DEBUG)
+    logger = logging.getLogger("healthcheck")
+    logger.info(msg)
+    sys.path.insert(0, engine)
+    os.chdir(engine)
+    from event_tracers.decoy_common.decoy_lib import send_to_fdc
+    send_to_fdc("rpts", conf.get("id"), {"status": 1, "version": conf.get("version"), "msg": msg},
+                logger, conf.get("network", {}).get("hostname"), monitor_ip(conf))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOL
+  chmod 700 /usr/local/sbin/boot-healthcheck
+
+  cat > /etc/systemd/system/boot-healthcheck.service <<'EOL'
+[Unit]
+Description=Boot health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/boot-healthcheck
+EOL
+  cat > /etc/systemd/system/boot-healthcheck.timer <<EOL
+[Unit]
+Description=Boot health check
+
+[Timer]
+OnBootSec=${DEPLOY_DIAG_MIN}min
+
+[Install]
+WantedBy=timers.target
+EOL
+  systemctl daemon-reload
+  systemctl enable boot-healthcheck.timer >/dev/null 2>&1
+}
+
 install_launcherD_service() {
 cat >/usr/bin/launcherD.py <<'EOL'
 #!/usr/bin/env python3
+import glob
 import json
 import logging
 import os
@@ -950,6 +1112,9 @@ from os import path
 import shutil
 import subprocess
 import time
+
+CD_DEVICES = ("/dev/cdrom", "/dev/sr[0-9]*")
+CD_WAIT = 180   # udev creates the CD device after this service starts
 
 
 class LauncherD():
@@ -961,23 +1126,57 @@ class LauncherD():
         self.init_logger()
 
     def init_logger(self):
-        # /root, not /tmp: the log must not be readable by an attacker's low-privilege shell
+        # /root, not /tmp: not readable by unprivileged users
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.DEBUG)
         handler = RotatingFileHandler("/root/launcherD.log", maxBytes=102400, backupCount=1)
         self.logger.addHandler(handler)
 
+    def find_cd(self):
+        """Mount the CD that carries trapinit, waiting for it to show up."""
+        import sh
+        deadline = time.time() + CD_WAIT
+        while True:
+            seen = set()
+            for pattern in CD_DEVICES:
+                for dev in sorted(glob.glob(pattern)):
+                    real = os.path.realpath(dev)
+                    if real in seen:
+                        continue
+                    seen.add(real)
+                    try:
+                        sh.mount("-o", "ro", dev, self.mount)
+                    except Exception:
+                        continue
+                    if path.isdir(path.join(self.mount, "trapinit")):
+                        self.logger.debug("init CD found on {}".format(dev))
+                        return True
+                    try:
+                        sh.umount(self.mount)
+                    except Exception:
+                        pass
+            if time.time() > deadline:
+                self.logger.error("no CD with trapinit after {}s, devices seen: {}".format(
+                    CD_WAIT, sorted(seen) or "none"))
+                return False
+            time.sleep(2)
+
     def load_config(self):
         import sh
+        if not self.find_cd():
+            return
         try:
-            sh.mount("/dev/cdrom", self.mount)
             if path.exists(self.dest):
                 shutil.rmtree(self.dest)
             shutil.copytree(self.mount, self.dest)
-            sh.umount(self.mount)
             self.logger.debug("got init files")
         except Exception:
             self.logger.error(traceback.format_exc())
+        finally:
+            try:
+                sh.umount(self.mount)
+            except Exception:
+                pass
 
     def run_init(self, init):
         script = path.join(self.dest, "trapinit", init)
@@ -1001,7 +1200,7 @@ class LauncherD():
         if os.path.exists(conf_path):
             with open(conf_path, "r") as f:
                 self.conf = json.load(f)
-            # the config holds decoy credentials and the FDC address: do not log it
+            # the config holds credentials: do not log it
             init = self.conf.get("init")
             if not init:
                 self.logger.error("no init script found!")
@@ -1121,6 +1320,7 @@ print_summary() {
   echo "  system sshd     : $(on DISABLE_SYSTEM_SSHD && echo masked || echo enabled)"
   echo "  bash cmd hook   : $(on ENABLE_CMD_LOGGING && echo on || echo off)"
   echo "  exec audit      : $(on ENABLE_EXEC_AUDIT && echo on || echo off)"
+  echo "  deploy diag     : $(on DEPLOY_DIAG && echo "on (${DEPLOY_DIAG_MIN} min)" || echo off)"
   if [ "$web" = apache ]; then
     echo "  WP login hook   : $([ -f "${WP_ROOT}/wp-content/mu-plugins/${WP_HOOK_FILE}" ] && echo installed || echo no)"
   fi
@@ -1137,6 +1337,7 @@ configure_samba
 configure_http_https
 configure_builtin_services
 configure_session_logging
+configure_deploy_diag
 install_launcherD_service
 prepare_base_image
 print_summary
