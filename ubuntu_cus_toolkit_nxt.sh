@@ -66,13 +66,14 @@ check_environment() {
 }
 
 configure_dns() {
-  echo -e "${blue}Configuring DNS fallback and syslog routing...${clear}"
+  echo -e "${blue}Configuring DNS fallback...${clear}"
 
   if [ -d "/etc/cloud/cloud.cfg.d" ]; then
     echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
   fi
 
   rm -f /usr/bin/systemd-resolve
+
   mkdir -p /etc/resolvconf/resolv.conf.d
   cat > /usr/local/sbin/resolvconf <<'EOL'
 #!/bin/sh
@@ -85,6 +86,7 @@ fi
 exit 0
 EOL
   chmod 755 /usr/local/sbin/resolvconf
+  ln -sfn /usr/local/sbin/resolvconf /usr/sbin/resolvconf
 
   echo -e "${green}DNS configured${clear}"
 }
@@ -95,17 +97,6 @@ configure_ssh() {
 
   systemctl disable --now ssh.socket 2>/dev/null || true
   systemctl enable ssh.service >/dev/null 2>&1 || true
-  mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/01-fdc-ssh.conf <<'EOL'
-PasswordAuthentication yes
-PermitRootLogin yes
-EOL
-
-  if ! sshd -t; then
-    echo -e "${red}Invalid sshd configuration${clear}"
-    exit 1
-  fi
-  systemctl restart ssh.service
   SERVICES+=("ssh")
 }
 
