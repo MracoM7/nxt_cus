@@ -154,6 +154,10 @@ EOL
   chmod 755 /usr/local/sbin/resolvconf
   ln -sfn /usr/local/sbin/resolvconf /usr/sbin/resolvconf
 
+  # The installer's netplan config (DHCP) never comes up in FDC networks: the engine sets
+  # the network itself. Without this, every boot waits ~2 min for "network online".
+  systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service >/dev/null 2>&1 || true
+
   echo -e "${green}DNS configured${clear}"
 }
 
