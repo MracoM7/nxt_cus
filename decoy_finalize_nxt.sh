@@ -7,9 +7,8 @@ export PATH="$PATH:/usr/sbin:/sbin"
 
 RESET_MACHINE_ID=true
 RESET_SSH_HOSTKEYS=false     # true: requires host key regeneration at first boot
-# Lock the accounts created while installing Ubuntu (uid 1000-59999): FDC applies its fake
-# shell only to its own lure users, so any other account with a password would give a real
-# shell. Requires a root password: root is then the only way in, from the FDC console only.
+# Lock local accounts (uid 1000-59999): the FDC fake shell covers only lure users.
+# Needs a root password: root, from the FDC console, is then the only way in.
 : "${LOCK_LOCAL_USERS:=true}"
 
 red='\033[0;31m'
