@@ -2,7 +2,8 @@ sudo su
 
 mkdir /tmp/mount /tmp/cus
 
-mount /dev/sr1 /tmp/mount
+# toolkit CD: sr1 on the first customization (sr0 is the Ubuntu ISO), sr0 afterwards
+mount /dev/sr1 /tmp/mount 2>/dev/null || mount /dev/sr0 /tmp/mount
 
 cp -R /tmp/mount/* /tmp/cus
 

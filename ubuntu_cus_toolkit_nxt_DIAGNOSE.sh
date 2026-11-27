@@ -1129,6 +1129,7 @@ EOL
 install_launcherD_service() {
 cat >/usr/bin/launcherD.py <<'EOL'
 #!/usr/bin/env python3
+import glob
 import json
 import logging
 import os
@@ -1138,6 +1139,9 @@ from os import path
 import shutil
 import subprocess
 import time
+
+CD_DEVICES = ("/dev/cdrom", "/dev/sr[0-9]*")
+CD_WAIT = 180   # seconds: udev creates the CD device a few seconds after this service starts
 
 
 class LauncherD():
@@ -1155,17 +1159,51 @@ class LauncherD():
         handler = RotatingFileHandler("/root/launcherD.log", maxBytes=102400, backupCount=1)
         self.logger.addHandler(handler)
 
+    def find_cd(self):
+        """Mount the CD that carries trapinit, waiting for it to show up."""
+        import sh
+        deadline = time.time() + CD_WAIT
+        while True:
+            seen = set()
+            for pattern in CD_DEVICES:
+                for dev in sorted(glob.glob(pattern)):
+                    real = os.path.realpath(dev)
+                    if real in seen:
+                        continue
+                    seen.add(real)
+                    try:
+                        sh.mount("-o", "ro", dev, self.mount)
+                    except Exception:
+                        continue
+                    if path.isdir(path.join(self.mount, "trapinit")):
+                        self.logger.debug("init CD found on {}".format(dev))
+                        return True
+                    try:
+                        sh.umount(self.mount)
+                    except Exception:
+                        pass
+            if time.time() > deadline:
+                self.logger.error("no CD with trapinit after {}s, devices seen: {}".format(
+                    CD_WAIT, sorted(seen) or "none"))
+                return False
+            time.sleep(2)
+
     def load_config(self):
         import sh
+        if not self.find_cd():
+            return
         try:
-            sh.mount("/dev/cdrom", self.mount)
             if path.exists(self.dest):
                 shutil.rmtree(self.dest)
             shutil.copytree(self.mount, self.dest)
-            sh.umount(self.mount)
             self.logger.debug("got init files")
         except Exception:
             self.logger.error(traceback.format_exc())
+        finally:
+            try:
+                sh.umount(self.mount)
+            except Exception:
+                pass
 
     def run_init(self, init):
         script = path.join(self.dest, "trapinit", init)
