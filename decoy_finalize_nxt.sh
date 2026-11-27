@@ -35,7 +35,7 @@ clean_logs() {
   journalctl --rotate >/dev/null 2>&1 || true
   journalctl --vacuum-time=1s >/dev/null 2>&1 || true
   apt-get clean
-  rm -f /tmp/launcherD.log /tmp/ubuntu_ready.py
+  rm -f /tmp/launcherD.log /root/launcherD.log /root/launcherD.log.1 /tmp/ubuntu_ready.py
 }
 
 clean_history() {
