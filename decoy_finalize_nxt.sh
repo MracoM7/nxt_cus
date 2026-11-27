@@ -7,6 +7,10 @@ export PATH="$PATH:/usr/sbin:/sbin"
 
 RESET_MACHINE_ID=true
 RESET_SSH_HOSTKEYS=false     # true: requires host key regeneration at first boot
+# Lock the accounts created while installing Ubuntu (uid 1000-59999): FDC applies its fake
+# shell only to its own lure users, so any other account with a password would give a real
+# shell. Requires a root password: root is then the only way in, from the FDC console only.
+: "${LOCK_LOCAL_USERS:=true}"
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -19,6 +23,25 @@ check_root() {
     echo -e "${red}This script must be run as root${clear}"
     exit 1
   fi
+}
+
+lock_local_users() {
+  [ "$LOCK_LOCAL_USERS" = true ] || return 0
+  if [ "$(passwd -S root 2>/dev/null | awk '{print $2}')" != "P" ]; then
+    echo -e "${red}root has no password: run 'passwd root' first, or you will not be able to log in${clear}"
+    echo -e "${red}to this image again when re-customizing it (or set LOCK_LOCAL_USERS=false)${clear}"
+    exit 1
+  fi
+  echo -e "${blue}Locking local accounts...${clear}"
+  local name uid g
+  while IFS=: read -r name _ uid _; do
+    [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || continue
+    passwd -l "$name" >/dev/null 2>&1
+    for g in sudo admin lxd adm; do
+      gpasswd -d "$name" "$g" >/dev/null 2>&1
+    done
+    echo "  ${name}: password locked, removed from sudo/lxd/adm"
+  done < /etc/passwd
 }
 
 stop_logging() {
@@ -61,6 +84,7 @@ reset_ssh_hostkeys() {
 }
 
 check_root
+lock_local_users
 stop_logging
 clean_logs
 clean_history

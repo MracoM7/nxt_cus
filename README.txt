@@ -26,6 +26,10 @@ bash ./ubuntu_cus_toolkit_nxt.sh
 #   ENABLE_HTTP_NATIVE=false ENABLE_HTTP_APACHE=true bash ./ubuntu_cus_toolkit_nxt.sh
 # Install WordPress in /var/www/html BEFORE running it: the login hook is added automatically.
 
+# First build only: give root a password. The finalize script locks every other local
+# account, so root (from the FDC console) is how you log in when re-customizing.
+passwd root
+
 bash ./decoy_finalize_nxt.sh
 
 trap - DEBUG; history -c && history -w && shutdown -h now

@@ -26,6 +26,9 @@ export DEBIAN_FRONTEND=noninteractive
 : "${ENABLE_RADIUS:=true}"
 : "${ENABLE_VNC:=true}"
 
+: "${ENABLE_CMD_LOGGING:=true}"     # alert on every command line typed in an interactive bash
+: "${ENABLE_EXEC_AUDIT:=true}"      # auditd: alert on commands typed in shells the bash hook misses
+
 : "${DISABLE_SYSTEM_SSHD:=true}"    # mask Ubuntu's sshd: FDC runs its own bundled sshd
 : "${APACHE_AUTO_INSTALL:=true}"    # install apache2 if Apache mode is on and it is missing
 : "${WP_LOGIN_HOOK:=auto}"          # auto|true|false: WordPress login events with user/pass
@@ -41,6 +44,11 @@ CERT_SYNC=/usr/local/sbin/a2certsync
 CERT_UNIT=apache2-certsync
 APACHE_OVERRIDE=/etc/systemd/system/apache2.service.d/override.conf
 WP_HOOK_FILE=audit-log.php
+FORWARDER=/usr/local/sbin/audit-forwarder         # relays shell activity to FDC (127.0.0.1:1399)
+FORWARDER_UNIT=audit-forwarder
+AUDISP_PLUGIN=/usr/local/sbin/audisp-forward
+AUDIT_RULES=/etc/audit/rules.d/50-user-exec.rules
+BASHRC=/etc/bash.bashrc
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -61,7 +69,8 @@ check_root() {
 validate_flags() {
   local f
   for f in ENABLE_SSH ENABLE_SAMBA ENABLE_HTTP_NATIVE ENABLE_HTTP_APACHE ENABLE_GIT \
-           ENABLE_SMTP ENABLE_FTP ENABLE_RADIUS ENABLE_VNC DISABLE_SYSTEM_SSHD APACHE_AUTO_INSTALL; do
+           ENABLE_SMTP ENABLE_FTP ENABLE_RADIUS ENABLE_VNC ENABLE_CMD_LOGGING ENABLE_EXEC_AUDIT \
+           DISABLE_SYSTEM_SSHD APACHE_AUTO_INSTALL; do
     if [ "${!f}" != "true" ] && [ "${!f}" != "false" ]; then
       echo -e "${red}${f} must be true or false (got '${!f}')${clear}"
       exit 1
@@ -104,6 +113,12 @@ check_environment() {
       echo -e "${red}Apache2 not installed and APACHE_AUTO_INSTALL=false${clear}"
       exit 1
     fi
+  fi
+
+  if on ENABLE_EXEC_AUDIT && ! command -v auditctl >/dev/null 2>&1; then
+    echo -e "${blue}Installing auditd...${clear}"
+    apt-get -y -qq update && apt-get -y -qq install auditd || {
+      echo -e "${red}Failed to install auditd${clear}"; exit 1; }
   fi
   echo -e "${green}Environment check passed${clear}"
 }
@@ -500,6 +515,429 @@ configure_builtin_services() {
   return 0
 }
 
+# Commands typed outside the FDC fake shell (after `bash`, `sh`, a python pty, ...) are sent
+# to the FDC event receiver in the fake shell's own format: they show up as SSH command
+# alerts of the attacker's session (FDC matches them by username).
+#   - bash hook (PS0): one message per command line typed at an interactive bash prompt
+#   - auditd execve: only for commands typed in interactive shells the hook does not cover
+# Never reported: shell startup files, tab completion, prompt hooks, the inside of scripts.
+remove_session_logging() {
+  sed -i '/^# >>> session-logging >>>$/,/^# <<< session-logging <<<$/d' "$BASHRC"
+  systemctl disable --now "${FORWARDER_UNIT}.service" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${FORWARDER_UNIT}.service" "$FORWARDER" "$AUDISP_PLUGIN" "$AUDIT_RULES" \
+        /etc/audit/plugins.d/audisp-forward.conf /etc/audisp/plugins.d/audisp-forward.conf
+  if command -v augenrules >/dev/null 2>&1; then
+    augenrules --load >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload
+}
+
+configure_session_logging() {
+  remove_session_logging
+  if ! on ENABLE_CMD_LOGGING && ! on ENABLE_EXEC_AUDIT; then
+    return 0
+  fi
+  echo -e "${blue}Configuring shell activity forwarding...${clear}"
+
+  cat > "$FORWARDER" <<'EOL'
+#!/usr/bin/env python3
+# Forwards interactive shell activity to the local event collector.
+#
+# Two inputs, one output (the FDC event receiver on 127.0.0.1:1399, same message the
+# engine's fake shell sends, so alerts look exactly like native SSH command alerts):
+#   - UDP 127.0.0.1:5140   one message per command line typed in an interactive bash
+#                          (PS0 hook in /etc/bash.bashrc)
+#   - unix socket          execve audit records (auditd plugin), used only for commands
+#                          typed in interactive shells the bash hook does not cover
+#                          (sh/dash, bash --norc, a bash whose hook was removed, ...)
+#
+# Noise rules: an exec is reported only if its parent is an interactive shell (stdin on a
+# tty, no script, no -c), that shell is not covered by a recent hook message, and the
+# shell is past its startup files. Children of scripts and of `sh -c` are never reported.
+import base64
+import json
+import os
+import pwd
+import re
+import select
+import socket
+import time
+
+COLLECTOR = ("127.0.0.1", 1399)
+HOOK_ADDR = ("127.0.0.1", 5140)
+AUDIT_SOCK = "/run/audit-forwarder.sock"
+
+SHELLS = {"bash", "rbash", "sh", "dash", "zsh", "ksh", "ksh93", "mksh", "ash",
+          "busybox", "fish", "tcsh", "csh", "yash"}
+VALUE_OPTS = {"--rcfile", "--init-file", "-o", "+o", "-O", "+O"}
+HOOK_WINDOW = 3.0       # seconds an exec stays covered by the bash hook
+STARTUP_GRACE = 1.0     # ignore execs made while a shell reads its startup files
+RATE_MAX, RATE_WINDOW = 20, 5.0
+EVENT_TIMEOUT = 0.3     # flush incomplete audit events after this idle time
+
+CLK = os.sysconf("SC_CLK_TCK")
+REC = re.compile(r"type=(\w+) msg=audit\(([^)]+)\):(.*)")
+FIELD = re.compile(r'([\w\[\]]+)=("[^"]*"|\S+)')
+ARG = re.compile(r"a(\d+)(?:\[(\d+)\])?$")
+
+hooked = {}    # bash pid -> time of its last hook message
+rate = {}      # shell pid -> (window start, count, suppression noted)
+pending = {}   # audit serial -> partial event
+out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+# ---------------------------------------------------------------- /proc helpers
+def exe_name(pid):
+    try:
+        return os.path.basename(os.readlink("/proc/{}/exe".format(pid)))
+    except OSError:
+        return ""
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/{}/cmdline".format(pid), "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def stat_fields(pid):
+    try:
+        with open("/proc/{}/stat".format(pid)) as f:
+            data = f.read()
+        return data[data.rfind(")") + 2:].split()
+    except OSError:
+        return []
+
+
+def ppid_of(pid):
+    f = stat_fields(pid)
+    return int(f[1]) if len(f) > 1 else 0
+
+
+def age(pid):
+    f = stat_fields(pid)
+    try:
+        with open("/proc/uptime") as u:
+            uptime = float(u.read().split()[0])
+        return uptime - int(f[19]) / CLK
+    except (OSError, IndexError, ValueError):
+        return 1e9
+
+
+def uid_of(pid):
+    try:
+        with open("/proc/{}/status".format(pid)) as f:
+            for line in f:
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def ssh_conn(pid):
+    try:
+        with open("/proc/{}/environ".format(pid), "rb") as f:
+            for kv in f.read().split(b"\0"):
+                if kv.startswith(b"SSH_CONNECTION="):
+                    return kv[15:].decode("utf-8", "replace")
+    except OSError:
+        pass
+    return ""
+
+
+def stdin_is_tty(pid):
+    try:
+        target = os.readlink("/proc/{}/fd/0".format(pid))
+    except OSError:
+        return False
+    return target.startswith("/dev/pts/") or target.startswith("/dev/tty")
+
+
+def interactive_shell(pid):
+    name = exe_name(pid)
+    if name not in SHELLS or not stdin_is_tty(pid):
+        return False
+    args = cmdline(pid)[1:]
+    if name == "busybox" and args and os.path.basename(args[0]) in SHELLS:
+        args = args[1:]
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in VALUE_OPTS:
+            skip = True
+        elif a.startswith("--"):
+            continue
+        elif a[:1] in ("-", "+"):
+            if "c" in a[1:]:
+                return False        # sh -c '...': not typed interactively
+        else:
+            return False            # running a script
+    return True
+
+
+def shell_chain(pid):
+    """pid plus its ancestors that are forked copies of the same shell (subshells)."""
+    exe, cl = exe_name(pid), cmdline(pid)
+    chain = [pid]
+    for _ in range(16):
+        p = ppid_of(chain[-1])
+        if p <= 1 or exe_name(p) != exe or cmdline(p) != cl:
+            break
+        chain.append(p)
+    return chain
+
+
+# ---------------------------------------------------------------- output
+def allowed(key, now):
+    start, count, noted = rate.get(key, (now, 0, False))
+    if now - start > RATE_WINDOW:
+        start, count, noted = now, 0, False
+    count += 1
+    if count <= RATE_MAX:
+        rate[key] = (start, count, noted)
+        return True, False
+    rate[key] = (start, count, True)
+    return False, not noted
+
+
+def b64(s):
+    return base64.b64encode(s.encode("utf-8", "replace")).decode()
+
+
+def emit(cmd, uid, pid, ppid, conn, key, now):
+    ok, note = allowed(key, now)
+    if not ok:
+        if not note:
+            return
+        cmd = "(high command rate, further commands suppressed for {:.0f}s)".format(RATE_WINDOW)
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = str(uid)
+    p = conn.split()
+    sip, sport, dip = (p[0], p[1], p[2]) if len(p) >= 3 else ("0.0.0.0", "0", "0.0.0.0")
+    msg = {"mtype": "ssh", "optype": 1304, "msg": b64(cmd), "username": b64(user),
+           "dport": 22, "sip": sip, "dip": dip, "sport": int(sport) if sport.isdigit() else 0,
+           "pid": pid, "ppid": ppid}
+    try:
+        out.sendto(json.dumps(msg).encode(), COLLECTOR)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- inputs
+def handle_hook(data, now):
+    parts = data.decode("utf-8", "replace").split("\x1f")
+    if len(parts) != 5 or parts[0] != "1" or not parts[1].isdigit():
+        return
+    pid, cmd = int(parts[1]), parts[4].strip()
+    if exe_name(pid) not in ("bash", "rbash"):
+        return
+    uid = uid_of(pid)
+    if uid is None:
+        return
+    hooked[pid] = now
+    if cmd:
+        emit(cmd, uid, pid, ppid_of(pid), ssh_conn(pid) or parts[3], pid, now)
+
+
+def unquote(v):
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        return v[1:-1]
+    if v == "(null)":
+        return ""
+    try:
+        return bytes.fromhex(v).decode("utf-8", "replace")
+    except ValueError:
+        return v
+
+
+def decode_argv(execve):
+    parts = {}
+    for k, v in execve.items():
+        m = ARG.match(k)
+        if m:
+            parts.setdefault(int(m.group(1)), {})[int(m.group(2) or 0)] = unquote(v)
+    return ["".join(p[j] for j in sorted(p)) for _, p in sorted(parts.items())]
+
+
+def process_exec(ev, now):
+    sc, ex = ev.get("SYSCALL"), ev.get("EXECVE")
+    if sc.get("success") != "yes" or sc.get("key") != '"uexec"':
+        return
+    try:
+        pid, ppid, euid = int(sc["pid"]), int(sc["ppid"]), int(sc["euid"])
+    except (KeyError, ValueError):
+        return
+    argv = decode_argv(ex)
+    if not argv or not interactive_shell(ppid):
+        return
+    chain = shell_chain(ppid)
+    if any(now - hooked.get(p, -1e9) < HOOK_WINDOW for p in chain):
+        return
+    top = chain[-1]
+    if age(top) < STARTUP_GRACE:
+        return
+    emit(" ".join(argv), euid, pid, ppid, ssh_conn(top), top, now)
+
+
+def handle_audit(data, now):
+    for line in data.decode("utf-8", "replace").splitlines():
+        m = REC.search(line)
+        if not m:
+            continue
+        rtype, serial, rest = m.groups()
+        ev = pending.setdefault(serial, {"t": now})
+        ev["t"] = now
+        if ev.get("done") or rtype not in ("SYSCALL", "EXECVE"):
+            if rtype == "EOE":
+                pending.pop(serial, None)
+            continue
+        ev[rtype] = dict(FIELD.findall(rest))
+        if "SYSCALL" in ev and "EXECVE" in ev:
+            ev["done"] = True
+            process_exec(ev, now)
+
+
+def main():
+    hook = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    hook.bind(HOOK_ADDR)
+    try:
+        os.unlink(AUDIT_SOCK)
+    except FileNotFoundError:
+        pass
+    old = os.umask(0o177)
+    aud = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    aud.bind(AUDIT_SOCK)
+    os.umask(old)
+
+    last_gc = time.monotonic()
+    while True:
+        ready, _, _ = select.select([hook, aud], [], [], EVENT_TIMEOUT)
+        now = time.monotonic()
+        for s in ready:
+            try:
+                data = s.recv(262144)
+                if s is hook:
+                    handle_hook(data, now)
+                else:
+                    handle_audit(data, now)
+            except Exception:
+                pass
+        for serial in [k for k, v in pending.items() if now - v["t"] > EVENT_TIMEOUT]:
+            pending.pop(serial, None)
+        if now - last_gc > 60:
+            last_gc = now
+            for d, ttl in ((hooked, 60), (rate, 60)):
+                for k in [k for k, v in d.items() if now - (v if d is hooked else v[0]) > ttl]:
+                    d.pop(k, None)
+
+
+if __name__ == "__main__":
+    main()
+EOL
+  chmod 755 "$FORWARDER"
+  if ! python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' "$FORWARDER"; then
+    echo -e "${red}Forwarder syntax check failed${clear}"
+    exit 1
+  fi
+
+  cat > "/etc/systemd/system/${FORWARDER_UNIT}.service" <<EOL
+[Unit]
+Description=Audit event forwarder
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 ${FORWARDER}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOL
+  systemctl daemon-reload
+  systemctl enable --now "${FORWARDER_UNIT}.service" >/dev/null 2>&1
+
+  if on ENABLE_CMD_LOGGING; then
+    cat >> "$BASHRC" <<'EOL'
+# >>> session-logging >>>
+# Interactive shell commands are logged per IT security policy.
+if [[ $- == *i* ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    __bp_preexec() {
+        local l
+        l=$(HISTTIMEFORMAT= builtin history 1)
+        l=${l#*[0-9]  }
+        [[ -n $l ]] || return 0
+        builtin printf '1\x1f%s\x1f%s\x1f%s\x1f%s' "$$" "${USER:-}" "${SSH_CONNECTION:-}" "$l" >/dev/udp/127.0.0.1/5140
+    } 2>/dev/null
+    __bp_precmd() {
+        HISTCONTROL=; HISTIGNORE=; builtin set -o history
+        PS0='$(__bp_preexec)'
+    }
+    [[ $PROMPT_COMMAND == *__bp_precmd* ]] || PROMPT_COMMAND="__bp_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+    PS0='$(__bp_preexec)'
+fi
+# <<< session-logging <<<
+EOL
+  fi
+
+  if on ENABLE_EXEC_AUDIT; then
+    cat > "$AUDISP_PLUGIN" <<'EOL'
+#!/usr/bin/env python3
+# auditd plugin: passes execve records to the local forwarder over a root-only socket.
+import re
+import signal
+import socket
+import sys
+
+SOCK = "/run/audit-forwarder.sock"
+KEEP = re.compile(rb"type=(SYSCALL|EXECVE|EOE) ")
+
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+for line in sys.stdin.buffer:
+    if KEEP.search(line[:200]):
+        try:
+            s.sendto(line, SOCK)
+        except OSError:
+            pass
+EOL
+    chown root:root "$AUDISP_PLUGIN"
+    chmod 750 "$AUDISP_PLUGIN"
+
+    local plugdir
+    for plugdir in /etc/audit/plugins.d /etc/audisp/plugins.d; do
+      [ -d "$plugdir" ] || continue
+      cat > "${plugdir}/audisp-forward.conf" <<EOL
+active = yes
+direction = out
+path = ${AUDISP_PLUGIN}
+type = always
+format = string
+EOL
+      chmod 640 "${plugdir}/audisp-forward.conf"
+      break
+    done
+
+    mkdir -p "$(dirname "$AUDIT_RULES")"
+    cat > "$AUDIT_RULES" <<'EOL'
+-a always,exit -F arch=b64 -S execve,execveat -F euid>=1000 -F euid<60000 -k uexec
+-a always,exit -F arch=b32 -S execve -F euid>=1000 -F euid<60000 -k uexec
+EOL
+    systemctl enable --now auditd >/dev/null 2>&1 || true
+    if ! augenrules --load >/dev/null 2>&1; then
+      echo -e "${red}Failed to load audit rules${clear}"
+      exit 1
+    fi
+    pkill -HUP -x auditd 2>/dev/null || true
+  fi
+}
+
 install_launcherD_service() {
 cat >/usr/bin/launcherD.py <<'EOL'
 #!/usr/bin/env python3
@@ -681,6 +1119,8 @@ print_summary() {
   echo -e "${green}Image profile${clear}"
   echo "  web mode        : ${web}"
   echo "  system sshd     : $(on DISABLE_SYSTEM_SSHD && echo masked || echo enabled)"
+  echo "  bash cmd hook   : $(on ENABLE_CMD_LOGGING && echo on || echo off)"
+  echo "  exec audit      : $(on ENABLE_EXEC_AUDIT && echo on || echo off)"
   if [ "$web" = apache ]; then
     echo "  WP login hook   : $([ -f "${WP_ROOT}/wp-content/mu-plugins/${WP_HOOK_FILE}" ] && echo installed || echo no)"
   fi
@@ -696,6 +1136,7 @@ configure_ssh
 configure_samba
 configure_http_https
 configure_builtin_services
+configure_session_logging
 install_launcherD_service
 prepare_base_image
 print_summary
